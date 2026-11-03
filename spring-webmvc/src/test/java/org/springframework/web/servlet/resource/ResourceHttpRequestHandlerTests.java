@@ -40,6 +40,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.accept.ContentNegotiationManager;
 import org.springframework.web.accept.ContentNegotiationManagerFactoryBean;
+import org.springframework.web.context.support.ServletContextResource;
 import org.springframework.web.context.support.StaticWebApplicationContext;
 import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.testfixture.servlet.MockHttpServletRequest;
@@ -443,6 +444,76 @@ class ResourceHttpRequestHandlerTests {
 			assertThat(this.response.getStatus()).isEqualTo(200);
 			assertThat(this.response.getContentAsString()).isEqualTo("spring");
 		}
+	}
+
+	@Test  // gh-36698
+	void shouldRejectTraversalRevealedByRemovingVersion(@TempDir Path tempDir) throws Exception {
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.writeString(location.resolve("public.txt"), "public");
+		Files.writeString(tempDir.resolve("secret.txt"), "secret");
+		Files.writeString(tempDir.resolve("secret"), "secret");
+		ContentVersionStrategy strategy = new ContentVersionStrategy();
+		String publicVersion = strategy.getResourceVersion(new FileSystemResource(location.resolve("public.txt")));
+		String version = strategy.getResourceVersion(new FileSystemResource(tempDir.resolve("secret.txt")));
+
+		VersionResourceResolver versionResolver = new VersionResourceResolver();
+		versionResolver.addContentVersionStrategy("/**");
+		this.handler.setLocations(List.of(new FileSystemResource(location.toString() + "/")));
+		this.handler.setResourceResolvers(List.of(versionResolver, new PathResourceResolver()));
+		this.handler.afterPropertiesSet();
+
+		String publicPath = "public-" + publicVersion + ".txt";
+		this.request = new MockHttpServletRequest(new TestServletContext(), "GET", "/resources/" + publicPath);
+		ServletRequestPathUtils.parseAndCache(this.request);
+		this.request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, publicPath);
+		this.response = new MockHttpServletResponse();
+		this.handler.handleRequest(this.request, this.response);
+		assertThat(this.response.getStatus()).isEqualTo(200);
+		assertThat(this.response.getContentAsString()).isEqualTo("public");
+
+		for (String path : List.of(
+				".-" + version + "./secret-" + version + ".txt",
+				".-" + version + "./secret",
+				"%2e-" + version + ".%2fsecret%2etxt")) {
+			this.request = new MockHttpServletRequest(new TestServletContext(), "GET", "/resources/" + path);
+			ServletRequestPathUtils.parseAndCache(this.request);
+			this.request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, path);
+			this.response = new MockHttpServletResponse();
+			this.handler.handleRequest(this.request, this.response);
+			assertThat(this.response.getStatus()).isEqualTo(HttpStatus.NOT_FOUND.value());
+			assertThat(this.response.getContentAsString()).doesNotContain("secret");
+		}
+	}
+
+	@Test  // gh-36693
+	void shouldRejectWebInfAndMetaInfIgnoringCase(@TempDir Path tempDir) throws Exception {
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.writeString(Files.createDirectories(location.resolve("web-inf")).resolve("secret.txt"), "secret");
+		Files.writeString(Files.createDirectories(location.resolve("Meta-Inf")).resolve("secret.txt"), "secret");
+
+		this.handler.setLocations(List.of(new FileSystemResource(location.toString() + "/")));
+		this.handler.afterPropertiesSet();
+
+		for (String path : List.of("web-inf/secret.txt", "Meta-Inf/secret.txt", "%77eb-inf/secret.txt")) {
+			this.request = new MockHttpServletRequest(new TestServletContext(), "GET", "/resources/" + path);
+			ServletRequestPathUtils.parseAndCache(this.request);
+			this.request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, path);
+			this.response = new MockHttpServletResponse();
+			this.handler.handleRequest(this.request, this.response);
+			assertThat(this.response.getStatus()).isEqualTo(HttpStatus.NOT_FOUND.value());
+			assertThat(this.response.getContentAsString()).doesNotContain("secret");
+		}
+	}
+
+	@Test  // gh-36693
+	void unsafeLocationsAreNotRejected() throws Exception {
+		TestServletContext servletContext = new TestServletContext();
+		this.handler.setLocations(List.of(new ClassPathResource("/"),
+				new ServletContextResource(servletContext, "/")));
+		this.handler.setServletContext(servletContext);
+		this.handler.afterPropertiesSet();
+
+		assertThat(this.handler.getLocations()).hasSize(2);
 	}
 
 	private void testInvalidPath(String requestPath, ResourceHttpRequestHandler handler) throws Exception {

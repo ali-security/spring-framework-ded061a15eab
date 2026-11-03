@@ -36,6 +36,7 @@ import org.apache.commons.logging.LogFactory;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.EmbeddedValueResolverAware;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
 import org.springframework.core.log.LogFormatUtils;
@@ -489,12 +490,31 @@ public class ResourceHttpRequestHandler extends WebContentGenerator
 		}
 
 		result.addAll(this.locationResources);
+		for (Resource location : result) {
+			checkResourceLocation(location);
+		}
+
 		if (isOptimizeLocations()) {
 			result = result.stream().filter(Resource::exists).toList();
 		}
 
 		this.locationsToUse.clear();
 		this.locationsToUse.addAll(result);
+	}
+
+	/**
+	 * Check the given location and log a warning if it is a well-known unsafe
+	 * choice: a classpath location with an empty path or "/", which exposes the
+	 * entire classpath.
+	 */
+	private void checkResourceLocation(@Nullable Resource location) {
+		if (location instanceof ClassPathResource classPathResource) {
+			String path = classPathResource.getPath();
+			if (path.isEmpty() || "/".equals(path)) {
+				logger.warn("Resource location '" + location + "' is considered unsafe " +
+						"and should not be used as it provides access to the entire classpath.");
+			}
+		}
 	}
 
 	/**
@@ -815,7 +835,8 @@ public class ResourceHttpRequestHandler extends WebContentGenerator
 	 * @since 3.0.6
 	 */
 	protected boolean isInvalidPath(String path) {
-		if (path.contains("WEB-INF") || path.contains("META-INF")) {
+		String pathLowerCase = path.toLowerCase(Locale.ROOT);
+		if (pathLowerCase.contains("web-inf") || pathLowerCase.contains("meta-inf")) {
 			if (logger.isWarnEnabled()) {
 				logger.warn(LogFormatUtils.formatValue(
 						"Path with \"WEB-INF\" or \"META-INF\": [" + path + "]", -1, true));

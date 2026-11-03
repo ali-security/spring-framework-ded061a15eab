@@ -23,21 +23,26 @@ import java.net.URI;
 import java.net.URL;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import jakarta.servlet.http.HttpServletRequest;
 
 import org.springframework.core.io.AbstractResource;
 import org.springframework.core.io.Resource;
+import org.springframework.core.log.LogFormatUtils;
 import org.springframework.http.HttpHeaders;
 import org.springframework.lang.Nullable;
 import org.springframework.util.AntPathMatcher;
 import org.springframework.util.Assert;
+import org.springframework.util.ResourceUtils;
 import org.springframework.util.StringUtils;
 
 /**
@@ -176,6 +181,9 @@ public class VersionResourceResolver extends AbstractResourceResolver {
 		}
 
 		String simplePath = versionStrategy.removeVersion(requestPath, candidateVersion);
+		if (shouldIgnoreInputPath(simplePath)) {
+			return null;
+		}
 		Resource baseResource = chain.resolveResource(request, simplePath, locations);
 		if (baseResource == null) {
 			return null;
@@ -231,6 +239,195 @@ public class VersionResourceResolver extends AbstractResourceResolver {
 			return this.versionStrategyMap.get(matchingPatterns.get(0));
 		}
 		return null;
+	}
+
+	/**
+	 * Whether the given input path, i.e. the request path with the version
+	 * removed, is invalid as determined by {@link #isInvalidPath(String)}.
+	 * The path is also decoded and the same checks are performed again.
+	 */
+	private boolean shouldIgnoreInputPath(String path) {
+		return (!StringUtils.hasText(path) || isInvalidPath(path) || isInvalidEncodedPath(path));
+	}
+
+	/**
+	 * Checks for invalid resource input paths rejecting the following:
+	 * <ul>
+	 * <li>Paths that contain "WEB-INF" or "META-INF" (case-insensitive)
+	 * <li>Paths that contain "../" after a call to
+	 * {@link org.springframework.util.StringUtils#cleanPath}.
+	 * <li>Paths that represent a {@link org.springframework.util.ResourceUtils#isUrl
+	 * valid URL} or would represent one after the leading slash is removed.
+	 * </ul>
+	 * @param path the path to validate
+	 * @return {@code true} if the path is invalid, {@code false} otherwise
+	 */
+	private boolean isInvalidPath(String path) {
+		String pathLowerCase = path.toLowerCase(Locale.ROOT);
+		if (pathLowerCase.contains("web-inf") || pathLowerCase.contains("meta-inf")) {
+			if (logger.isWarnEnabled()) {
+				logger.warn(LogFormatUtils.formatValue(
+						"Path with \"WEB-INF\" or \"META-INF\": [" + path + "]", -1, true));
+			}
+			return true;
+		}
+		if (path.contains(":/")) {
+			String relativePath = (path.charAt(0) == '/' ? path.substring(1) : path);
+			if (ResourceUtils.isUrl(relativePath) || relativePath.startsWith("url:")) {
+				if (logger.isWarnEnabled()) {
+					logger.warn(LogFormatUtils.formatValue(
+							"Path represents URL or has \"url:\" prefix: [" + path + "]", -1, true));
+				}
+				return true;
+			}
+		}
+		if (path.contains("../")) {
+			if (logger.isWarnEnabled()) {
+				logger.warn(LogFormatUtils.formatValue(
+						"Path contains \"../\" after call to StringUtils#cleanPath: [" + path + "]", -1, true));
+			}
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Check whether the given path contains invalid escape sequences.
+	 * @param path the path to validate
+	 * @return {@code true} if the path is invalid, {@code false} otherwise
+	 */
+	private boolean isInvalidEncodedPath(String path) {
+		String decodedPath = decode(path);
+		if (decodedPath.contains("%")) {
+			decodedPath = decode(decodedPath);
+		}
+		if (!StringUtils.hasText(decodedPath)) {
+			return true;
+		}
+		if (isInvalidPath(decodedPath)) {
+			return true;
+		}
+		decodedPath = normalizeInputPath(decodedPath);
+		return isInvalidPath(decodedPath);
+	}
+
+	/**
+	 * Normalize the given resource path, replacing the following:
+	 * <ul>
+	 * <li>Backslash with forward slash.
+	 * <li>Duplicate occurrences of slash with a single slash.
+	 * <li>Any combination of leading slash and control characters (00-1F and 7F)
+	 * with a single "/" or "". For example {@code "  / // foo/bar"}
+	 * becomes {@code "/foo/bar"}.
+	 * </ul>
+	 */
+	private static String normalizeInputPath(String path) {
+		path = StringUtils.replace(path, "\\", "/");
+		path = cleanDuplicateSlashes(path);
+		return cleanLeadingSlash(path);
+	}
+
+	private static String cleanDuplicateSlashes(String path) {
+		StringBuilder sb = null;
+		char prev = 0;
+		for (int i = 0; i < path.length(); i++) {
+			char curr = path.charAt(i);
+			try {
+				if ((curr == '/') && (prev == '/')) {
+					if (sb == null) {
+						sb = new StringBuilder(path.substring(0, i));
+					}
+					continue;
+				}
+				if (sb != null) {
+					sb.append(path.charAt(i));
+				}
+			}
+			finally {
+				prev = curr;
+			}
+		}
+		return (sb != null ? sb.toString() : path);
+	}
+
+	private static String cleanLeadingSlash(String path) {
+		boolean slash = false;
+		for (int i = 0; i < path.length(); i++) {
+			if (path.charAt(i) == '/') {
+				slash = true;
+			}
+			else if (path.charAt(i) > ' ' && path.charAt(i) != 127) {
+				if (i == 0 || (i == 1 && slash)) {
+					return path;
+				}
+				return (slash ? "/" + path.substring(i) : path.substring(i));
+			}
+		}
+		return (slash ? "/" : "");
+	}
+
+	private static String decode(String path) {
+		try {
+			return uriDecode(path, StandardCharsets.UTF_8);
+		}
+		catch (Exception ex) {
+			return "";
+		}
+	}
+
+	/**
+	 * Decode the given encoded URI component value by replacing "<i>{@code %xy}</i>"
+	 * sequences by an hexadecimal representation of the character in the specified
+	 * charset, letting other characters unchanged.
+	 * @param source the encoded {@code String}
+	 * @param charset the character encoding to use to decode the "<i>{@code %xy}</i>" sequences
+	 * @return the decoded value
+	 * @throws IllegalArgumentException when the given source contains invalid encoded sequences
+	 */
+	private static String uriDecode(String source, Charset charset) {
+		int length = source.length();
+		int firstPercentIndex = source.indexOf('%');
+		if (length == 0 || firstPercentIndex < 0) {
+			return source;
+		}
+
+		StringBuilder output = new StringBuilder(length);
+		output.append(source, 0, firstPercentIndex);
+		byte[] bytes = null;
+		int i = firstPercentIndex;
+		while (i < length) {
+			char ch = source.charAt(i);
+			if (ch == '%') {
+				try {
+					if (bytes == null) {
+						bytes = new byte[(length - i) / 3];
+					}
+
+					int pos = 0;
+					while (i + 2 < length && ch == '%') {
+						bytes[pos++] = (byte) HexFormat.fromHexDigits(source, i + 1, i + 3);
+						i += 3;
+						if (i < length) {
+							ch = source.charAt(i);
+						}
+					}
+
+					if (i < length && ch == '%') {
+						throw new IllegalArgumentException("Incomplete trailing escape (%) pattern");
+					}
+
+					output.append(new String(bytes, 0, pos, charset));
+				}
+				catch (NumberFormatException ex) {
+					throw new IllegalArgumentException("Invalid encoded sequence \"" + source.substring(i) + "\"");
+				}
+			}
+			else {
+				output.append(ch);
+				i++;
+			}
+		}
+		return output.toString();
 	}
 
 

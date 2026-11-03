@@ -386,6 +386,60 @@ class ResourceWebHandlerTests {
 		}
 	}
 
+	@Test  // gh-36698
+	void shouldRejectTraversalRevealedByRemovingVersion(@TempDir Path tempDir) throws Exception {
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.writeString(location.resolve("public.txt"), "public");
+		Files.writeString(tempDir.resolve("secret.txt"), "secret");
+		Files.writeString(tempDir.resolve("secret"), "secret");
+		ContentVersionStrategy strategy = new ContentVersionStrategy();
+		String publicVersion = strategy.getResourceVersion(
+				new FileSystemResource(location.resolve("public.txt"))).block(TIMEOUT);
+		String version = strategy.getResourceVersion(
+				new FileSystemResource(tempDir.resolve("secret.txt"))).block(TIMEOUT);
+
+		VersionResourceResolver versionResolver = new VersionResourceResolver();
+		versionResolver.addContentVersionStrategy("/**");
+		ResourceWebHandler handler = new ResourceWebHandler();
+		handler.setLocations(List.of(new FileSystemResource(location.toString() + "/")));
+		handler.setResourceResolvers(List.of(versionResolver, new PathResourceResolver()));
+		handler.afterPropertiesSet();
+
+		MockServerWebExchange exchange = MockServerWebExchange.from(MockServerHttpRequest.get(""));
+		setPathWithinHandlerMapping(exchange, "public-" + publicVersion + ".txt");
+		setBestMachingPattern(exchange, "/**");
+		handler.handle(exchange).block(TIMEOUT);
+		assertResponseBody(exchange, "public");
+
+		testInvalidPath(".-" + version + "./secret-" + version + ".txt", handler);
+		testInvalidPath(".-" + version + "./secret", handler);
+		testInvalidPath("%2e-" + version + ".%2fsecret%2etxt", handler);
+	}
+
+	@Test  // gh-36693
+	void shouldRejectWebInfAndMetaInfIgnoringCase(@TempDir Path tempDir) throws Exception {
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.writeString(Files.createDirectories(location.resolve("web-inf")).resolve("secret.txt"), "secret");
+		Files.writeString(Files.createDirectories(location.resolve("Meta-Inf")).resolve("secret.txt"), "secret");
+
+		ResourceWebHandler handler = new ResourceWebHandler();
+		handler.setLocations(List.of(new FileSystemResource(location.toString() + "/")));
+		handler.afterPropertiesSet();
+
+		testInvalidPath("web-inf/secret.txt", handler);
+		testInvalidPath("Meta-Inf/secret.txt", handler);
+		testInvalidPath("%77eb-inf/secret.txt", handler);
+	}
+
+	@Test  // gh-36693
+	void unsafeLocationsAreNotRejected() throws Exception {
+		ResourceWebHandler handler = new ResourceWebHandler();
+		handler.setLocations(List.of(new ClassPathResource("/"), new ClassPathResource("")));
+		handler.afterPropertiesSet();
+
+		assertThat(handler.getLocations()).hasSize(2);
+	}
+
 	private void testInvalidPath(String requestPath, ResourceWebHandler handler) {
 		ServerWebExchange exchange = MockServerWebExchange.from(MockServerHttpRequest.get(""));
 		setPathWithinHandlerMapping(exchange, requestPath);

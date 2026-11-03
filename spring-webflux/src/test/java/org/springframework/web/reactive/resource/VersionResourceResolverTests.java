@@ -16,22 +16,31 @@
 
 package org.springframework.web.reactive.resource;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import reactor.core.publisher.Mono;
 
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
+import org.springframework.lang.Nullable;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.testfixture.http.server.reactive.MockServerHttpRequest;
 import org.springframework.web.testfixture.server.MockServerWebExchange;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -167,6 +176,106 @@ class VersionResourceResolverTests {
 		verify(this.versionStrategy, times(1)).getResourceVersion(expected);
 		assertThat(actual).isInstanceOf(HttpResource.class);
 		assertThat(((HttpResource) actual).getResponseHeaders().getETag()).isEqualTo(("W/\"" + version + "\""));
+	}
+
+	@ParameterizedTest  // gh-36698
+	@ValueSource(strings = {
+			"",
+			"../secret.txt",
+			"css/../../secret.txt",
+			"..\\secret.txt",
+			"%2e%2e/secret.txt",
+			"%2E%2E%2Fsecret.txt",
+			"%2e%2e%5csecret.txt",
+			"%252e%252e%252fsecret.txt",
+			"WEB-INF/web.xml",
+			"web-inf/web.xml",
+			"META-INF/MANIFEST.MF",
+			"Meta-Inf/MANIFEST.MF",
+			"%77eb-inf/web.xml",
+			"file:/etc/passwd",
+			"/url:file:/etc/passwd"
+	})
+	void resolveResourceIgnoresInvalidPathAfterVersionRemoved(String simplePath) {
+		String versionFile = "bar-version.css";
+		String version = "version";
+		given(this.chain.resolveResource(null, versionFile, this.locations)).willReturn(Mono.empty());
+		given(this.chain.resolveResource(null, simplePath, this.locations)).willReturn(Mono.empty());
+		given(this.versionStrategy.extractVersion(versionFile)).willReturn(version);
+		given(this.versionStrategy.removeVersion(versionFile, version)).willReturn(simplePath);
+
+		this.resolver.setStrategyMap(Collections.singletonMap("/**", this.versionStrategy));
+		Resource actual = this.resolver
+				.resolveResourceInternal(null, versionFile, this.locations, this.chain)
+				.block(Duration.ofMillis(5000));
+
+		assertThat(actual).isNull();
+		verify(this.chain, never()).resolveResource(null, simplePath, this.locations);
+		verify(this.versionStrategy, never()).getResourceVersion(any());
+	}
+
+	@Test  // gh-36698
+	void resolveResourceWithRepeatedVersionDoesNotEscapeLocation(@TempDir Path tempDir) throws Exception {
+		// Removing every occurrence of the version turns ".-{version}./" into "../"
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.writeString(location.resolve("public.txt"), "public");
+		Path secret = Files.writeString(tempDir.resolve("secret.txt"), "secret");
+		ContentVersionStrategy strategy = new ContentVersionStrategy();
+		String publicVersion = strategy.getResourceVersion(
+				new FileSystemResource(location.resolve("public.txt"))).block(Duration.ofMillis(5000));
+		String version = strategy.getResourceVersion(new FileSystemResource(secret)).block(Duration.ofMillis(5000));
+
+		Resource resource = resolveFromFileSystem(location, strategy, "public-" + publicVersion + ".txt");
+		assertThat(resource).isNotNull();
+		assertThat(resource.getContentAsByteArray()).isEqualTo("public".getBytes());
+
+		resource = resolveFromFileSystem(location, strategy, ".-" + version + "./secret-" + version + ".txt");
+		assertThat(resource).isNull();
+	}
+
+	@Test  // gh-36698
+	void resolveResourceWithTraversalAfterVersionRemovedDoesNotEscapeLocation(@TempDir Path tempDir) throws Exception {
+		// Removing only the last occurrence of the version can still yield "../",
+		// possibly encoded: "%2e-{version}.%2fsecret%2etxt" becomes "%2e.%2fsecret%2etxt"
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Path secret = Files.writeString(tempDir.resolve("secret"), "secret");
+		Files.writeString(tempDir.resolve("secret.txt"), "secret");
+		ContentVersionStrategy strategy = new ContentVersionStrategy();
+		String version = strategy.getResourceVersion(new FileSystemResource(secret)).block(Duration.ofMillis(5000));
+
+		assertThat(resolveFromFileSystem(location, strategy, ".-" + version + "./secret")).isNull();
+		assertThat(resolveFromFileSystem(location, strategy, "%2e-" + version + ".%2fsecret%2etxt")).isNull();
+	}
+
+	@Test  // gh-36698
+	void resolveResourceDoesNotComputeVersionOfResourceOutsideLocation(@TempDir Path tempDir) throws Exception {
+		// Computing the content version of an arbitrary file outside the location
+		// (e.g. a very large file or a device) can hold the request indefinitely
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.write(tempDir.resolve("large.bin"), new byte[8192]);
+		Files.write(tempDir.resolve("large"), new byte[8192]);
+		List<Resource> versionedResources = new ArrayList<>();
+		ContentVersionStrategy strategy = new ContentVersionStrategy() {
+			@Override
+			public Mono<String> getResourceVersion(Resource resource) {
+				versionedResources.add(resource);
+				return super.getResourceVersion(resource);
+			}
+		};
+
+		for (String path : List.of(".-x./large-x.bin", ".-x./large", "%2e-x.%2flarge%2ebin")) {
+			assertThat(resolveFromFileSystem(location, strategy, path)).isNull();
+		}
+		assertThat(versionedResources).isEmpty();
+	}
+
+	@Nullable
+	private Resource resolveFromFileSystem(Path location, VersionStrategy strategy, String requestPath) {
+		this.resolver.setStrategyMap(Collections.singletonMap("/**", strategy));
+		List<Resource> fileSystemLocations = List.of(new FileSystemResource(location.toString() + "/"));
+		ResourceResolverChain resolverChain =
+				new DefaultResourceResolverChain(List.of(this.resolver, new PathResourceResolver()));
+		return resolverChain.resolveResource(null, requestPath, fileSystemLocations).block(Duration.ofMillis(5000));
 	}
 
 	@Test
