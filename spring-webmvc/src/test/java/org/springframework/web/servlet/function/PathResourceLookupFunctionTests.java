@@ -165,6 +165,27 @@ class PathResourceLookupFunctionTests {
 		assertThat(result).isNotPresent();
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"link/%2e%2e/secret.txt",
+			"link/%2E%2E/secret.txt",
+			"link%2f%2e%2e%2fsecret.txt",
+			"link/..%2fsecret.txt",
+			"link/%252e%252e/secret.txt"
+	})
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating symbolic links requires elevated privileges")
+	void fileSystemResourceLocationWithEncodedTraversalThroughSymlink(String path) throws Exception {
+		// An encoded "../" that StringUtils#cleanPath removes passes validation, but
+		// the file system resolves ".." against the symlink target, outside the location.
+		Resource location = initFileSystemLocation();
+		Files.createDirectories(this.tempDir.resolve("outside"));
+		Files.createSymbolicLink(this.tempDir.resolve("static/link"), this.tempDir.resolve("outside"));
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isNotPresent();
+	}
+
 	@Test
 	void servletContextResourceLocation() throws Exception {
 		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initServletContextLocation());

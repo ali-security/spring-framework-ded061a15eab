@@ -17,12 +17,17 @@
 package org.springframework.web.servlet.resource;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.FileSystemResource;
@@ -40,6 +45,7 @@ import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.testfixture.servlet.MockHttpServletRequest;
 import org.springframework.web.testfixture.servlet.MockHttpServletResponse;
 import org.springframework.web.testfixture.servlet.MockServletContext;
+import org.springframework.web.util.ServletRequestPathUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
@@ -365,7 +371,33 @@ class ResourceHttpRequestHandlerTests {
 		testInvalidPath("/../.." + secretPath, handler);
 		testInvalidPath("/%2E%2E/testsecret/secret.txt", handler);
 		testInvalidPath("/%2E%2E/testsecret/secret.txt", handler);
-		testInvalidPath("%2F%2F%2E%2E%2F%2F%2E%2E" + secretPath, handler);
+		testInvalidPath("%252E%252E%252Ftestsecret%252Fsecret.txt", handler);
+		testInvalidPath("%252e%252e%252ftestsecret%252fsecret.txt", handler);
+		testInvalidPath("%2E%2E%252Ftestsecret/secret.txt", handler);
+	}
+
+	@Test
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating symbolic links requires elevated privileges")
+	void shouldRejectEncodedTraversalThroughSymlink(@TempDir Path tempDir) throws Exception {
+		// An encoded "../" that StringUtils#cleanPath removes passes validation, but
+		// the file system resolves ".." against the symlink target, outside the location.
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.createDirectories(tempDir.resolve("outside"));
+		Files.createSymbolicLink(location.resolve("link"), tempDir.resolve("outside"));
+		Files.writeString(tempDir.resolve("secret.txt"), "secret");
+
+		this.handler.setLocations(List.of(new FileSystemResource(location.toString() + "/")));
+		this.handler.afterPropertiesSet();
+
+		for (String path : List.of("link/%2e%2e/secret.txt", "link%2f%2e%2e%2fsecret.txt", "link/%252e%252e/secret.txt")) {
+			this.request = new MockHttpServletRequest(new TestServletContext(), "GET", "/resources/" + path);
+			ServletRequestPathUtils.parseAndCache(this.request);
+			this.request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, path);
+			this.response = new MockHttpServletResponse();
+			this.handler.handleRequest(this.request, this.response);
+			assertThat(this.response.getStatus()).isEqualTo(HttpStatus.NOT_FOUND.value());
+			assertThat(this.response.getContentAsString()).doesNotContain("secret");
+		}
 	}
 
 	private void testInvalidPath(String requestPath, ResourceHttpRequestHandler handler) throws Exception {
@@ -463,6 +495,14 @@ class ResourceHttpRequestHandlerTests {
 		assertThat(this.handler.processPath("\\\\foo\\ \\bar\\\\baz\\\\")).isEqualTo("/foo/ /bar/baz/");
 		assertThat(this.handler.processPath("foo\\\\/\\////bar")).isEqualTo("foo/bar");
 
+		// encoded or double-encoded "../" is decoded and normalized
+		assertThat(this.handler.processPath("foo/%2e%2e/bar")).isEqualTo("bar");
+		assertThat(this.handler.processPath("foo/%252e%252e/bar")).isEqualTo("bar");
+		assertThat(this.handler.processPath("%2e%2e%2fbar")).isEqualTo("../bar");
+		assertThat(this.handler.processPath("%252e%252e%252fbar")).isEqualTo("../bar");
+
+		// other encoded characters are left unchanged
+		assertThat(this.handler.processPath("/foo/a%20b.txt")).isEqualTo("/foo/a%20b.txt");
 	}
 
 	@Test
