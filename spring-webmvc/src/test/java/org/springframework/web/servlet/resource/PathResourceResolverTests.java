@@ -19,20 +19,26 @@ package org.springframework.web.servlet.resource;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
 import org.springframework.web.context.support.ServletContextResource;
 import org.springframework.web.testfixture.servlet.MockHttpServletRequest;
 import org.springframework.web.testfixture.servlet.MockServletContext;
+import org.springframework.web.util.ServletRequestPathUtils;
 import org.springframework.web.util.UrlPathHelper;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.fail;
 
 /**
@@ -174,6 +180,71 @@ public class PathResourceResolverTests {
 		assertThat(location.getSavedRelativePath()).isEqualTo("%C3%84%20%3B%C3%A4.txt");
 	}
 
+	@Test
+	void relativePathDecodedForNonUrlResource() {
+		TestClassPathResource location = new TestClassPathResource("test/");
+		List<TestClassPathResource> locations = Collections.singletonList(location);
+		MockHttpServletRequest request = new MockHttpServletRequest("GET", "/");
+		ServletRequestPathUtils.parseAndCache(request);
+
+		this.resolver.resolveResource(request, "T%C5%8Dky%C5%8D", locations, null);
+		assertThat(location.getSavedRelativePath()).isEqualTo("Tōkyō");
+
+		this.resolver.resolveResource(request, "/Z%C3%BCrich", locations, null);
+		assertThat(location.getSavedRelativePath()).isEqualTo("/Zürich");
+
+		this.resolver.resolveResource(request, "Tōkyō", locations, null);
+		assertThat(location.getSavedRelativePath()).isEqualTo("Tōkyō");
+
+		this.resolver.resolveResource(request, "%20’", locations, null);
+		assertThat(location.getSavedRelativePath()).isEqualTo(" ’");
+
+		this.resolver.resolveResource(request, "śpřìńġ", locations, null);
+		assertThat(location.getSavedRelativePath()).isEqualTo("śpřìńġ");
+
+		this.resolver.resolveResource(request, "%20śpřìńġ", locations, null);
+		assertThat(location.getSavedRelativePath()).isEqualTo(" śpřìńġ");
+
+		// U+012E and U+012F must not be truncated to '.' and '/'
+		this.resolver.resolveResource(request, "ĮĮįsecret%2Etxt", locations, null);
+		assertThat(location.getSavedRelativePath()).isEqualTo("ĮĮįsecret.txt");
+	}
+
+	@Test
+	void relativePathWithInvalidEncodedSequenceForNonUrlResource() {
+		TestClassPathResource location = new TestClassPathResource("test/");
+		List<TestClassPathResource> locations = Collections.singletonList(location);
+		MockHttpServletRequest request = new MockHttpServletRequest("GET", "/");
+		ServletRequestPathUtils.parseAndCache(request);
+
+		assertThatIllegalArgumentException().isThrownBy(() ->
+				this.resolver.resolveResource(request, "foo%2", locations, null));
+		assertThatIllegalArgumentException().isThrownBy(() ->
+				this.resolver.resolveResource(request, "foo%", locations, null));
+		assertThatIllegalArgumentException().isThrownBy(() ->
+				this.resolver.resolveResource(request, "%", locations, null));
+		assertThatIllegalArgumentException().isThrownBy(() ->
+				this.resolver.resolveResource(request, "%zz", locations, null));
+	}
+
+	@Test
+	void shouldNotResolveTraversalRevealedByDecodingNonAsciiCharacters(@TempDir Path tempDir) throws Exception {
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.writeString(location.resolve("file.txt"), "file");
+		Files.writeString(tempDir.resolve("secret.txt"), "secret");
+		List<Resource> locations = List.of(new FileSystemResource(location.toString() + "/"));
+		MockHttpServletRequest request = new MockHttpServletRequest("GET", "/");
+		ServletRequestPathUtils.parseAndCache(request);
+
+		// U+012E and U+012F must not be truncated to '.' and '/', revealing "../"
+		assertThat(this.resolver.resolveResource(request, "ĮĮįsecret%2Etxt", locations, null)).isNull();
+		assertThat(this.resolver.resolveResource(request, "ĮĮįsecret.tx%74", locations, null)).isNull();
+
+		Resource resource = this.resolver.resolveResource(request, "fil%65.txt", locations, null);
+		assertThat(resource).isNotNull();
+		assertThat(resource.getFile()).isEqualTo(location.resolve("file.txt").toFile());
+	}
+
 	private Resource getResource(String filePath) {
 		return new ClassPathResource("test/" + filePath, getClass());
 	}
@@ -195,6 +266,28 @@ public class PathResourceResolverTests {
 
 		@Override
 		public Resource createRelative(String relativePath) throws MalformedURLException {
+			this.relativePath = relativePath;
+			return this;
+		}
+	}
+
+
+	private static class TestClassPathResource extends ClassPathResource {
+
+		private String relativePath;
+
+
+		public TestClassPathResource(String path) {
+			super(path, PathResourceResolverTests.class);
+		}
+
+
+		public String getSavedRelativePath() {
+			return this.relativePath;
+		}
+
+		@Override
+		public Resource createRelative(String relativePath) {
 			this.relativePath = relativePath;
 			return this;
 		}

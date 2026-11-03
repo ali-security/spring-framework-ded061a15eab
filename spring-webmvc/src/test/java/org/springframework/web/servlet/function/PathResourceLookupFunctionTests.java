@@ -186,6 +186,36 @@ class PathResourceLookupFunctionTests {
 		assertThat(result).isNotPresent();
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"ĮĮįsecret%2Etxt",
+			"sub/../%25C4%25AE%25C4%25AE%25C4%25AFsecret%25252Etxt",
+			"sub/%2e%2e/%25C4%25AE%25C4%25AE%25C4%25AFsecret%25252Etxt"
+	})
+	void fileSystemResourceLocationWithTraversalRevealedByDecodingNonAsciiCharacters(String path) throws Exception {
+		// U+012E and U+012F must not be truncated to '.' and '/' while decoding
+		// the path for the location, after it has passed validation.
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isNotPresent();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"%20śpřìńġ.txt",
+			"%20%C5%9Bp%C5%99%C3%AC%C5%84%C4%A1.txt"
+	})
+	void fileSystemResourceLocationWithEncodedNonAsciiFilename(String path) throws Exception {
+		Resource location = initFileSystemLocation();
+		Files.writeString(this.tempDir.resolve("static/ śpřìńġ.txt"), "file");
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isPresent();
+		assertThat(result.get().getFile()).isEqualTo(this.tempDir.resolve("static/ śpřìńġ.txt").toFile());
+	}
+
 	@Test
 	void servletContextResourceLocation() throws Exception {
 		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initServletContextLocation());

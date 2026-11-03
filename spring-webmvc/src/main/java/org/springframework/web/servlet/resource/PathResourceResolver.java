@@ -23,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.StringTokenizer;
@@ -265,7 +266,7 @@ public class PathResourceResolver extends AbstractResourceResolver {
 					ServletRequestPathUtils.getCachedPath(request) instanceof PathContainer);
 
 			if (shouldDecodeRelativePath(location, usesPathPattern)) {
-				return UriUtils.decode(path, StandardCharsets.UTF_8);
+				return uriDecode(path, StandardCharsets.UTF_8);
 			}
 			else if (shouldEncodeRelativePath(location, usesPathPattern)) {
 				Charset charset = this.locationCharsets.getOrDefault(location, StandardCharsets.UTF_8);
@@ -301,6 +302,61 @@ public class PathResourceResolver extends AbstractResourceResolver {
 	private boolean shouldEncodeRelativePath(Resource location, boolean usesPathPattern) {
 		return (location instanceof UrlResource && !usesPathPattern &&
 				this.urlPathHelper != null && this.urlPathHelper.isUrlDecode());
+	}
+
+	/**
+	 * Decode the given encoded URI component value by replacing "<i>{@code %xy}</i>"
+	 * sequences by an hexadecimal representation of the character in the specified
+	 * charset, letting other characters unchanged.
+	 * @param source the encoded {@code String}
+	 * @param charset the character encoding to use to decode the "<i>{@code %xy}</i>" sequences
+	 * @return the decoded value
+	 * @throws IllegalArgumentException when the given source contains invalid encoded sequences
+	 */
+	private static String uriDecode(String source, Charset charset) {
+		int length = source.length();
+		int firstPercentIndex = source.indexOf('%');
+		if (length == 0 || firstPercentIndex < 0) {
+			return source;
+		}
+
+		StringBuilder output = new StringBuilder(length);
+		output.append(source, 0, firstPercentIndex);
+		byte[] bytes = null;
+		int i = firstPercentIndex;
+		while (i < length) {
+			char ch = source.charAt(i);
+			if (ch == '%') {
+				try {
+					if (bytes == null) {
+						bytes = new byte[(length - i) / 3];
+					}
+
+					int pos = 0;
+					while (i + 2 < length && ch == '%') {
+						bytes[pos++] = (byte) HexFormat.fromHexDigits(source, i + 1, i + 3);
+						i += 3;
+						if (i < length) {
+							ch = source.charAt(i);
+						}
+					}
+
+					if (i < length && ch == '%') {
+						throw new IllegalArgumentException("Incomplete trailing escape (%) pattern");
+					}
+
+					output.append(new String(bytes, 0, pos, charset));
+				}
+				catch (NumberFormatException ex) {
+					throw new IllegalArgumentException("Invalid encoded sequence \"" + source.substring(i) + "\"");
+				}
+			}
+			else {
+				output.append(ch);
+				i++;
+			}
+		}
+		return output.toString();
 	}
 
 	private boolean isInvalidEncodedPath(String resourcePath) {
