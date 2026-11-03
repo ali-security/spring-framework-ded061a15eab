@@ -30,6 +30,7 @@ import org.springframework.web.testfixture.servlet.MockHttpServletRequest;
 import org.springframework.web.testfixture.servlet.MockHttpServletResponse;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 /**
  * @author Arjen Poutsma
@@ -147,6 +148,124 @@ class SseServerResponseTests {
 
 				""";
 		assertThat(this.mockResponse.getContentAsString()).isEqualTo(expected);
+	}
+
+	@Test
+	void sendStringWithCarriageReturn() throws Exception {
+		String body = "line1\rline2\r\nline3";
+		ServerResponse response = ServerResponse.sse(sse -> {
+			try {
+				sse.send(body);
+			}
+			catch (IOException ex) {
+				throw new UncheckedIOException(ex);
+			}
+		});
+
+		ServerResponse.Context context = Collections::emptyList;
+
+		ModelAndView mav = response.writeTo(this.mockRequest, this.mockResponse, context);
+		assertThat(mav).isNull();
+
+		String expected = "data:line1\ndata:line2\ndata:line3\n\n";
+		assertThat(this.mockResponse.getContentAsString()).isEqualTo(expected);
+	}
+
+	@Test
+	void commentWithCarriageReturn() throws Exception {
+		ServerResponse response = ServerResponse.sse(sse -> {
+			try {
+				sse.comment("line1\rline2").send("");
+			}
+			catch (IOException ex) {
+				throw new UncheckedIOException(ex);
+			}
+		});
+
+		ServerResponse.Context context = Collections::emptyList;
+
+		ModelAndView mav = response.writeTo(this.mockRequest, this.mockResponse, context);
+		assertThat(mav).isNull();
+
+		String expected = ":line1\n:line2\ndata:\n\n";
+		assertThat(this.mockResponse.getContentAsString()).isEqualTo(expected);
+	}
+
+	@Test
+	void sendStringWithCarriageReturnCannotInjectEvent() throws Exception {
+		String body = "safe\revent:injected\rid:666\r\rdata:forged";
+		ServerResponse response = ServerResponse.sse(sse -> {
+			try {
+				sse.send(body);
+			}
+			catch (IOException ex) {
+				throw new UncheckedIOException(ex);
+			}
+		});
+
+		ServerResponse.Context context = Collections::emptyList;
+
+		ModelAndView mav = response.writeTo(this.mockRequest, this.mockResponse, context);
+		assertThat(mav).isNull();
+
+		String expected = "data:safe\ndata:event:injected\ndata:id:666\ndata:\ndata:data:forged\n\n";
+		assertThat(this.mockResponse.getContentAsString()).isEqualTo(expected);
+	}
+
+	@Test
+	void commentWithCarriageReturnCannotInjectEvent() throws Exception {
+		ServerResponse response = ServerResponse.sse(sse -> {
+			try {
+				sse.comment("note\r\ndata:forged\r\revent:injected").send("");
+			}
+			catch (IOException ex) {
+				throw new UncheckedIOException(ex);
+			}
+		});
+
+		ServerResponse.Context context = Collections::emptyList;
+
+		ModelAndView mav = response.writeTo(this.mockRequest, this.mockResponse, context);
+		assertThat(mav).isNull();
+
+		String expected = ":note\n:data:forged\n:\n:event:injected\ndata:\n\n";
+		assertThat(this.mockResponse.getContentAsString()).isEqualTo(expected);
+	}
+
+	@Test
+	void idWithLineSeparatorIsRejected() throws Exception {
+		for (String separator : new String[] {"\n", "\r", "\r\n"}) {
+			MockHttpServletRequest servletRequest = new MockHttpServletRequest("GET", "https://example.com");
+			servletRequest.setAsyncSupported(true);
+			MockHttpServletResponse servletResponse = new MockHttpServletResponse();
+			ServerResponse response = ServerResponse.sse(sse ->
+					assertThatIllegalArgumentException().isThrownBy(() ->
+							sse.id("1" + separator + "data:forged")));
+
+			ServerResponse.Context context = Collections::emptyList;
+
+			ModelAndView mav = response.writeTo(servletRequest, servletResponse, context);
+			assertThat(mav).isNull();
+			assertThat(servletResponse.getContentAsString()).isEmpty();
+		}
+	}
+
+	@Test
+	void eventWithLineSeparatorIsRejected() throws Exception {
+		for (String separator : new String[] {"\n", "\r", "\r\n"}) {
+			MockHttpServletRequest servletRequest = new MockHttpServletRequest("GET", "https://example.com");
+			servletRequest.setAsyncSupported(true);
+			MockHttpServletResponse servletResponse = new MockHttpServletResponse();
+			ServerResponse response = ServerResponse.sse(sse ->
+					assertThatIllegalArgumentException().isThrownBy(() ->
+							sse.event("custom" + separator + "data:forged")));
+
+			ServerResponse.Context context = Collections::emptyList;
+
+			ModelAndView mav = response.writeTo(servletRequest, servletResponse, context);
+			assertThat(mav).isNull();
+			assertThat(servletResponse.getContentAsString()).isEmpty();
+		}
 	}
 
 

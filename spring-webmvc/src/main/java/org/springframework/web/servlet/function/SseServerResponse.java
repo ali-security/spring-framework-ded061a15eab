@@ -138,35 +138,83 @@ final class SseServerResponse extends AbstractServerResponse {
 		@Override
 		public SseBuilder id(String id) {
 			Assert.hasLength(id, "Id must not be empty");
-			return field("id", id);
+			assertNoLineSeparator(id);
+			this.builder.append("id:").append(id).append('\n');
+			return this;
 		}
 
 		@Override
 		public SseBuilder event(String eventName) {
 			Assert.hasLength(eventName, "Name must not be empty");
-			return field("event", eventName);
+			assertNoLineSeparator(eventName);
+			this.builder.append("event:").append(eventName).append('\n');
+			return this;
 		}
 
 		@Override
 		public SseBuilder retry(Duration duration) {
 			Assert.notNull(duration, "Duration must not be null");
-			String millis = Long.toString(duration.toMillis());
-			return field("retry", millis);
+			this.builder.append("retry:").append(duration.toMillis()).append('\n');
+			return this;
 		}
 
 		@Override
 		public SseBuilder comment(String comment) {
 			Assert.hasLength(comment, "Comment must not be empty");
-			String[] lines = comment.split("\n");
-			for (String line : lines) {
-				field("", line);
-			}
-			return this;
+			return field("", comment);
 		}
 
 		private SseBuilder field(String name, String value) {
-			this.builder.append(name).append(':').append(value).append('\n');
+			this.builder.append(name).append(':');
+			appendFieldValue(name, value, this.builder);
+			this.builder.append('\n');
 			return this;
+		}
+
+		/**
+		 * Append {@code value} to {@code output}, replacing each line separator
+		 * ({@code "\n"}, {@code "\r"}, or {@code "\r\n"}) it contains with a new
+		 * {@code field} line (that is, {@code "\n" + field + ":"}). This keeps a
+		 * multi-line field value from breaking out of the current SSE field when
+		 * written on the wire.
+		 * @param field the name of the SSE field that {@code value} belongs to
+		 * (for example, {@code "data"}), or an empty string for a comment
+		 * @param value the field value to escape and append
+		 * @param output the {@code StringBuilder} to append the escaped value to
+		 */
+		private static void appendFieldValue(String field, String value, StringBuilder output) {
+			if (value.indexOf('\n') == -1 && value.indexOf('\r') == -1) {
+				output.append(value);
+				return;
+			}
+			String lineSeparatorReplacement = "\n" + field + ":";
+			int length = value.length();
+			for (int i = 0; i < length; i++) {
+				char c = value.charAt(i);
+				if (c == '\r') {
+					if (i + 1 < length && value.charAt(i + 1) == '\n') {
+						i++;
+					}
+					output.append(lineSeparatorReplacement);
+				}
+				else if (c == '\n') {
+					output.append(lineSeparatorReplacement);
+				}
+				else {
+					output.append(c);
+				}
+			}
+		}
+
+		/**
+		 * Assert that the given single-line SSE field value, such as an
+		 * {@code id} or {@code event} name, does not contain a line separator.
+		 * @param content the field value to check
+		 * @throws IllegalArgumentException if {@code content} contains {@code "\n"} or {@code "\r"}
+		 */
+		private static void assertNoLineSeparator(String content) {
+			Assert.isTrue(content.indexOf('\n') == -1 && content.indexOf('\r') == -1,
+					"illegal character '\\n' or '\\r' in event content");
 		}
 
 		@Override
@@ -182,10 +230,7 @@ final class SseServerResponse extends AbstractServerResponse {
 		}
 
 		private void writeString(String string) throws IOException {
-			String[] lines = string.split("\n");
-			for (String line : lines) {
-				field("data", line);
-			}
+			field("data", string);
 			this.builder.append('\n');
 
 			try {
