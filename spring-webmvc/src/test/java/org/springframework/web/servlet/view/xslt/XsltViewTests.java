@@ -21,6 +21,7 @@ import java.io.InputStreamReader;
 import java.io.StringReader;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import javax.xml.parsers.DocumentBuilder;
@@ -33,17 +34,22 @@ import org.dom4j.Document;
 import org.dom4j.Element;
 import org.dom4j.io.SAXReader;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.xml.sax.SAXException;
 
+import org.springframework.context.ApplicationContextException;
 import org.springframework.context.support.StaticApplicationContext;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
+import org.springframework.util.ClassUtils;
 import org.springframework.web.testfixture.servlet.MockHttpServletRequest;
 import org.springframework.web.testfixture.servlet.MockHttpServletResponse;
 
 import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonMap;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 /**
@@ -153,6 +159,105 @@ public class XsltViewTests {
 		assertHtmlOutput(this.response.getContentAsString());
 		assertThat(this.response.getContentAsString()).contains("Product List");
 
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"/org/springframework/web/servlet/view/xslt/../xslt/products.xsl",
+			"org/springframework/web/servlet/view/xslt/../xslt/products.xsl",
+			"\\org\\springframework\\web\\servlet\\view\\xslt\\..\\xslt\\products.xsl",
+			"/org/springframework/web/servlet/view/xslt/%2e%2e/xslt/products.xsl",
+			"/org/springframework/web/servlet/view/xslt/%2E%2E%2Fxslt/products.xsl",
+			"/org/springframework/web/servlet/view/xslt/%252e%252e/xslt/products.xsl",
+			"/org/springframework/web/servlet/view/xslt/%zz/products.xsl",
+			"/WEB-INF/xsl/products.xsl",
+			"/web-inf/xsl/products.xsl",
+			"/%57EB-INF/xsl/products.xsl",
+			"classpath:META-INF/products.xsl",
+			"http://attacker.example.org/evil.xsl",
+			"/http://attacker.example.org/evil.xsl",
+			"  //http://attacker.example.org/evil.xsl",
+			"http%3A//attacker.example.org/evil.xsl",
+			"url:http://attacker.example.org/evil.xsl",
+			"file:/etc/passwd",
+			"file:///etc/passwd",
+			"   ",
+			""
+	})
+	void invalidStylesheetLocationIsRejected(String url) {
+		assertThatExceptionOfType(ApplicationContextException.class)
+				.isThrownBy(() -> getXsltView(url))
+				.withMessageContaining("Invalid XSLT stylesheet location");
+	}
+
+	@Test
+	void absoluteFileUrlStylesheetLocationIsRejected() throws Exception {
+		// A stylesheet that exists and would otherwise be loaded and compiled
+		String url = new ClassPathResource("products.xsl", getClass()).getURL().toExternalForm();
+		assertThatExceptionOfType(ApplicationContextException.class)
+				.isThrownBy(() -> getXsltView(url))
+				.withMessageContaining("Invalid XSLT stylesheet location");
+	}
+
+	@Test
+	void invalidStylesheetLocationIsRejectedOnRenderWithoutTemplateCache() {
+		XsltView view = new XsltView();
+		view.setUrl("http://attacker.example.org/evil.xsl");
+		view.setCacheTemplates(false);
+		view.setApplicationContext(new StaticApplicationContext());
+
+		assertThatExceptionOfType(ApplicationContextException.class)
+				.isThrownBy(() -> view.render(singletonMap("someKey", getProductDataResource()), this.request, this.response))
+				.withMessageContaining("Invalid XSLT stylesheet location");
+	}
+
+	@Test
+	void stylesheetLocationIsNormalized() throws Exception {
+		XsltView view = new XsltView();
+		view.setUrl(" /org/springframework/web/servlet/view/xslt/products.xsl");
+		view.setCacheTemplates(false);
+		view.setApplicationContext(new StaticApplicationContext());
+
+		view.render(singletonMap("someKey", getProductDataResource()), this.request, this.response);
+		assertHtmlOutput(this.response.getContentAsString());
+	}
+
+	@Test
+	void traversalViaResolvedViewNameIsRejected() {
+		StaticApplicationContext ctx = new StaticApplicationContext();
+		ctx.refresh();
+
+		XsltViewResolver viewResolver = new XsltViewResolver();
+		viewResolver.setPrefix(ClassUtils.classPackageAsResourcePath(getClass()) + "/");
+		viewResolver.setSuffix(".xsl");
+		viewResolver.setApplicationContext(ctx);
+
+		assertThatExceptionOfType(ApplicationContextException.class)
+				.isThrownBy(() -> viewResolver.resolveViewName("../xslt/products", Locale.ENGLISH))
+				.withMessageContaining("Invalid XSLT stylesheet location");
+		assertThatExceptionOfType(ApplicationContextException.class)
+				.isThrownBy(() -> viewResolver.resolveViewName("%2e%2e/xslt/products", Locale.ENGLISH))
+				.withMessageContaining("Invalid XSLT stylesheet location");
+	}
+
+	@Test
+	void urlViaResolvedViewNameIsRejected() throws Exception {
+		StaticApplicationContext ctx = new StaticApplicationContext();
+		ctx.refresh();
+
+		XsltViewResolver viewResolver = new XsltViewResolver();
+		viewResolver.setSuffix(".xsl");
+		viewResolver.setApplicationContext(ctx);
+
+		String fileUrl = new ClassPathResource("products.xsl", getClass()).getURL().toExternalForm();
+		String viewName = fileUrl.substring(0, fileUrl.length() - ".xsl".length());
+		assertThatExceptionOfType(ApplicationContextException.class)
+				.isThrownBy(() -> viewResolver.resolveViewName(viewName, Locale.ENGLISH))
+				.withMessageContaining("Invalid XSLT stylesheet location");
+
+		// A regular view name still resolves and loads its stylesheet
+		viewResolver.setPrefix(ClassUtils.classPackageAsResourcePath(getClass()) + "/");
+		assertThat(viewResolver.resolveViewName("products", Locale.ENGLISH)).isInstanceOf(XsltView.class);
 	}
 
 	private org.w3c.dom.Document getDomDocument() throws ParserConfigurationException, SAXException, IOException {
