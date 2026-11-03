@@ -24,6 +24,8 @@ import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.springframework.cache.Cache;
 import org.springframework.cache.concurrent.ConcurrentMapCache;
@@ -176,6 +178,47 @@ public class CachingResourceResolverTests {
 
 		exchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", "gzip"));
 		assertThat(this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT)).isSameAs(gzipped);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"x-gzip", "notgzip", "gzipx", "gzip-9", "deflate, xgzip;q=1"})
+	void resolveEncodedResourceWithCodingContainingGzip(String acceptEncoding, GzippedFiles gzippedFiles) {
+		String file = "bar.css";
+		gzippedFiles.create(file);
+		ResourceResolverChain chain = encodedResourceChain();
+
+		// 1. Resolve with a coding that merely contains "gzip"
+
+		MockServerWebExchange exchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", acceptEncoding));
+		Resource resolved = chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+
+		assertThat(resolved).isNotInstanceOf(HttpResource.class);
+		assertThat(this.cache.get(resourceKey(file)).get()).isSameAs(resolved);
+
+		// 2. Resolve without Accept-Encoding from the cache
+
+		exchange = MockServerWebExchange.from(get(file));
+		Resource plain = chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+
+		assertThat(plain).isSameAs(resolved);
+		assertThat(plain).isNotInstanceOf(HttpResource.class);
+
+		// 3. Resolve with gzip under its own cache key
+
+		exchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", "GZIP;q=0.8"));
+		Resource gzipped = chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+
+		assertThat(gzipped).isInstanceOf(HttpResource.class);
+		assertThat(this.cache.get(resourceKey(file + "+encoding=gzip")).get()).isSameAs(gzipped);
+		assertThat(this.cache.get(resourceKey(file)).get()).isSameAs(plain);
+	}
+
+	private ResourceResolverChain encodedResourceChain() {
+		List<ResourceResolver> resolvers = new ArrayList<>();
+		resolvers.add(new CachingResourceResolver(this.cache));
+		resolvers.add(new EncodedResourceResolver());
+		resolvers.add(new PathResourceResolver());
+		return new DefaultResourceResolverChain(resolvers);
 	}
 
 	private static String resourceKey(String key) {

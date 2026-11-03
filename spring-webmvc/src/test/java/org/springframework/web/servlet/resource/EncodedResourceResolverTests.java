@@ -16,6 +16,10 @@
 
 package org.springframework.web.servlet.resource;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -23,6 +27,8 @@ import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.springframework.cache.Cache;
 import org.springframework.cache.concurrent.ConcurrentMapCache;
@@ -134,8 +140,115 @@ public class EncodedResourceResolverTests {
 		assertThat(resolved.getFilename()).isEqualTo(getResource(file).getFilename());
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"gzip", "GZIP", " gzip ", "gzip;q=0.8", "deflate, gzip;q=0.5 , identity"})
+	void resolveGzippedWithAcceptedCoding(String acceptEncoding, GzippedFiles gzippedFiles) {
+		String file = "js/foo.js";
+		gzippedFiles.create(file);
+		MockHttpServletRequest request = new MockHttpServletRequest();
+		request.addHeader("Accept-Encoding", acceptEncoding);
+		Resource actual = this.resolver.resolveResource(request, file, this.locations);
+
+		assertThat(actual.getDescription()).isEqualTo(getResource(file + ".gz").getDescription());
+		assertThat(actual).isInstanceOf(HttpResource.class);
+		HttpHeaders headers = ((HttpResource) actual).getResponseHeaders();
+		assertThat(headers.getFirst(HttpHeaders.CONTENT_ENCODING)).isEqualTo("gzip");
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"notgzip", "gzipx", "x-gzip", "gzip-9", "deflate, xgzip;q=1"})
+	void resolveWithCodingContainingGzip(String acceptEncoding, GzippedFiles gzippedFiles) {
+		String file = "js/foo.js";
+		gzippedFiles.create(file);
+		MockHttpServletRequest request = new MockHttpServletRequest();
+		request.addHeader("Accept-Encoding", acceptEncoding);
+		Resource actual = this.resolver.resolveResource(request, file, this.locations);
+
+		assertThat(actual.getDescription()).isEqualTo(getResource(file).getDescription());
+		assertThat(actual).isNotInstanceOf(HttpResource.class);
+	}
+
+	@Test
+	void resolveBrotli() throws IOException {
+		String file = "js/foo.js";
+		File brFile = createBrotliFile(file);
+		try {
+			MockHttpServletRequest request = new MockHttpServletRequest();
+			request.addHeader("Accept-Encoding", "br");
+			Resource actual = this.resolver.resolveResource(request, file, this.locations);
+
+			assertThat(actual.getDescription()).isEqualTo(getResource(file + ".br").getDescription());
+			assertThat(actual).isInstanceOf(HttpResource.class);
+			HttpHeaders headers = ((HttpResource) actual).getResponseHeaders();
+			assertThat(headers.getFirst(HttpHeaders.CONTENT_ENCODING)).isEqualTo("br");
+		}
+		finally {
+			brFile.delete();
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"abr", "brotli", "br-fake", "deflate, x-br;q=1"})
+	void resolveWithCodingContainingBr(String acceptEncoding) throws IOException {
+		String file = "js/foo.js";
+		File brFile = createBrotliFile(file);
+		try {
+			MockHttpServletRequest request = new MockHttpServletRequest();
+			request.addHeader("Accept-Encoding", acceptEncoding);
+			Resource actual = this.resolver.resolveResource(request, file, this.locations);
+
+			assertThat(actual.getDescription()).isEqualTo(getResource(file).getDescription());
+			assertThat(actual).isNotInstanceOf(HttpResource.class);
+		}
+		finally {
+			brFile.delete();
+		}
+	}
+
+	@Test
+	void resolveFromCacheWithCodingContainingGzip(GzippedFiles gzippedFiles) {
+		// 1. Resolve with a coding that merely contains "gzip"
+		String file = "js/foo.js";
+		gzippedFiles.create(file);
+		MockHttpServletRequest request = new MockHttpServletRequest("GET", "/js/foo.js");
+		request.addHeader("Accept-Encoding", "x-gzip");
+		Resource resolved = this.resolver.resolveResource(request, file, this.locations);
+
+		assertThat(resolved.getDescription()).isEqualTo(getResource(file).getDescription());
+		assertThat(resolved).isNotInstanceOf(HttpResource.class);
+
+		// 2. Resolve without Accept-Encoding: the cache must not serve a gzipped variant
+		request = new MockHttpServletRequest("GET", "/js/foo.js");
+		resolved = this.resolver.resolveResource(request, file, this.locations);
+
+		assertThat(resolved.getDescription()).isEqualTo(getResource(file).getDescription());
+		assertThat(resolved).isNotInstanceOf(HttpResource.class);
+	}
+
+	@Test
+	void parseAcceptEncoding() {
+		MockHttpServletRequest request = new MockHttpServletRequest();
+		assertThat(EncodedResourceResolver.parseAcceptEncoding(request)).isEmpty();
+
+		request = new MockHttpServletRequest();
+		request.addHeader("Accept-Encoding", "  ");
+		assertThat(EncodedResourceResolver.parseAcceptEncoding(request)).isEmpty();
+
+		request = new MockHttpServletRequest();
+		request.addHeader("Accept-Encoding", "GZIP;q=0.8, Br , deflate,, x-gzip ; q=0.1");
+		assertThat(EncodedResourceResolver.parseAcceptEncoding(request))
+				.containsExactly("gzip", "br", "deflate", "x-gzip");
+	}
+
 	private Resource getResource(String filePath) {
 		return new ClassPathResource("test/" + filePath, getClass());
+	}
+
+	private File createBrotliFile(String filePath) throws IOException {
+		File original = getResource(filePath).getFile();
+		File brFile = new File(original.getAbsolutePath() + ".br");
+		Files.copy(original.toPath(), brFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+		return brFile;
 	}
 
 }
