@@ -36,6 +36,7 @@ import org.springframework.core.ReactiveAdapter;
 import org.springframework.core.ReactiveAdapterRegistry;
 import org.springframework.core.ResolvableType;
 import org.springframework.core.annotation.AnnotationAwareOrderComparator;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.lang.Nullable;
@@ -50,6 +51,7 @@ import org.springframework.web.reactive.HandlerResultHandler;
 import org.springframework.web.reactive.accept.RequestedContentTypeResolver;
 import org.springframework.web.reactive.result.HandlerResultHandlerSupport;
 import org.springframework.web.server.NotAcceptableStatusException;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.server.ServerWebExchange;
 
 /**
@@ -205,42 +207,47 @@ public class ViewResolutionResultHandler extends HandlerResultHandlerSupport imp
 						clazz = returnValue.getClass();
 					}
 
-					if (returnValue == NO_VALUE || clazz == void.class || clazz == Void.class) {
-						viewsMono = resolveViews(getDefaultViewName(exchange), locale);
-					}
-					else if (CharSequence.class.isAssignableFrom(clazz) && !hasModelAnnotation(parameter)) {
-						viewsMono = resolveViews(returnValue.toString(), locale);
-					}
-					else if (Rendering.class.isAssignableFrom(clazz)) {
-						Rendering render = (Rendering) returnValue;
-						HttpStatusCode status = render.status();
-						if (status != null) {
-							exchange.getResponse().setStatusCode(status);
+					try {
+						if (returnValue == NO_VALUE || clazz == void.class || clazz == Void.class) {
+							viewsMono = resolveViews(getDefaultViewName(exchange), locale);
 						}
-						exchange.getResponse().getHeaders().putAll(render.headers());
-						model.addAllAttributes(render.modelAttributes());
-						Object view = render.view();
-						if (view == null) {
-							view = getDefaultViewName(exchange);
+						else if (CharSequence.class.isAssignableFrom(clazz) && !hasModelAnnotation(parameter)) {
+							viewsMono = resolveViews(returnValue.toString(), locale);
 						}
-						viewsMono = (view instanceof String viewName ? resolveViews(viewName, locale) :
-								Mono.just(Collections.singletonList((View) view)));
+						else if (Rendering.class.isAssignableFrom(clazz)) {
+							Rendering render = (Rendering) returnValue;
+							HttpStatusCode status = render.status();
+							if (status != null) {
+								exchange.getResponse().setStatusCode(status);
+							}
+							exchange.getResponse().getHeaders().putAll(render.headers());
+							model.addAllAttributes(render.modelAttributes());
+							Object view = render.view();
+							if (view == null) {
+								view = getDefaultViewName(exchange);
+							}
+							viewsMono = (view instanceof String viewName ? resolveViews(viewName, locale) :
+									Mono.just(Collections.singletonList((View) view)));
+						}
+						else if (Model.class.isAssignableFrom(clazz)) {
+							model.addAllAttributes(((Model) returnValue).asMap());
+							viewsMono = resolveViews(getDefaultViewName(exchange), locale);
+						}
+						else if (Map.class.isAssignableFrom(clazz) && !hasModelAnnotation(parameter)) {
+							model.addAllAttributes((Map<String, ?>) returnValue);
+							viewsMono = resolveViews(getDefaultViewName(exchange), locale);
+						}
+						else if (View.class.isAssignableFrom(clazz)) {
+							viewsMono = Mono.just(Collections.singletonList((View) returnValue));
+						}
+						else {
+							String name = getNameForReturnValue(parameter);
+							model.addAttribute(name, returnValue);
+							viewsMono = resolveViews(getDefaultViewName(exchange), locale);
+						}
 					}
-					else if (Model.class.isAssignableFrom(clazz)) {
-						model.addAllAttributes(((Model) returnValue).asMap());
-						viewsMono = resolveViews(getDefaultViewName(exchange), locale);
-					}
-					else if (Map.class.isAssignableFrom(clazz) && !hasModelAnnotation(parameter)) {
-						model.addAllAttributes((Map<String, ?>) returnValue);
-						viewsMono = resolveViews(getDefaultViewName(exchange), locale);
-					}
-					else if (View.class.isAssignableFrom(clazz)) {
-						viewsMono = Mono.just(Collections.singletonList((View) returnValue));
-					}
-					else {
-						String name = getNameForReturnValue(parameter);
-						model.addAttribute(name, returnValue);
-						viewsMono = resolveViews(getDefaultViewName(exchange), locale);
+					catch (ResponseStatusException ex) {
+						return Mono.error(ex);
 					}
 					BindingContext bindingContext = result.getBindingContext();
 					updateBindingResult(bindingContext, exchange);
@@ -256,11 +263,15 @@ public class ViewResolutionResultHandler extends HandlerResultHandlerSupport imp
 	/**
 	 * Select a default view name when a controller did not specify it.
 	 * Use the request path the leading and trailing slash stripped.
+	 * @throws ResponseStatusException with a 400 error code if the path contains a "redirect:" prefix
 	 */
 	private String getDefaultViewName(ServerWebExchange exchange) {
 		String path = exchange.getRequest().getPath().pathWithinApplication().value();
 		if (path.startsWith("/")) {
 			path = path.substring(1);
+		}
+		if (path.startsWith(UrlBasedViewResolver.REDIRECT_URL_PREFIX)) {
+			throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Rejected path '" + path + "' with 'redirect:' prefix");
 		}
 		if (path.endsWith("/")) {
 			path = path.substring(0, path.length() - 1);
