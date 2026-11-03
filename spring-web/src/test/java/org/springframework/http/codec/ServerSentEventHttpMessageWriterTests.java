@@ -91,6 +91,25 @@ class ServerSentEventHttpMessageWriterTests extends AbstractDataBufferAllocating
 	}
 
 	@ParameterizedDataBufferAllocatingTest
+	void writeServerSentEventWithMultiLineComment(DataBufferFactory bufferFactory) {
+		super.bufferFactory = bufferFactory;
+
+		MockServerHttpResponse outputMessage = new MockServerHttpResponse(super.bufferFactory);
+		Flux<ServerSentEvent> source = Flux.just(
+				ServerSentEvent.builder().comment("first\ndata:second").data("bar").build(),
+				ServerSentEvent.builder().comment("first\rdata:second").data("bar").build(),
+				ServerSentEvent.builder().comment("first\r\ndata:second").data("bar").build());
+		testWrite(source, outputMessage, ServerSentEvent.class);
+
+		StepVerifier.create(outputMessage.getBody())
+				.consumeNextWith(stringConsumer(":first\n:data:second\ndata:bar\n\n"))
+				.consumeNextWith(stringConsumer(":first\n:data:second\ndata:bar\n\n"))
+				.consumeNextWith(stringConsumer(":first\n:data:second\ndata:bar\n\n"))
+				.expectComplete()
+				.verify();
+	}
+
+	@ParameterizedDataBufferAllocatingTest
 	void writeString(DataBufferFactory bufferFactory) {
 		super.bufferFactory = bufferFactory;
 
@@ -110,12 +129,13 @@ class ServerSentEventHttpMessageWriterTests extends AbstractDataBufferAllocating
 		super.bufferFactory = bufferFactory;
 
 		MockServerHttpResponse outputMessage = new MockServerHttpResponse(super.bufferFactory);
-		Flux<String> source = Flux.just("foo\nbar", "foo\nbaz");
+		Flux<String> source = Flux.just("first\nsecond", "first\rsecond", "first\r\nsecond");
 		testWrite(source, outputMessage, String.class);
 
 		StepVerifier.create(outputMessage.getBody())
-				.consumeNextWith(stringConsumer("data:foo\ndata:bar\n\n"))
-				.consumeNextWith(stringConsumer("data:foo\ndata:baz\n\n"))
+				.consumeNextWith(stringConsumer("data:first\ndata:second\n\n"))
+				.consumeNextWith(stringConsumer("data:first\ndata:second\n\n"))
+				.consumeNextWith(stringConsumer("data:first\ndata:second\n\n"))
 				.expectComplete()
 				.verify();
 	}
