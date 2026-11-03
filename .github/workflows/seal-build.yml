@@ -1,0 +1,267 @@
+name: Seal Build
+
+# Spring Framework 6.0.x has no GitHub Actions build or test workflow; upstream
+# builds and tests on Concourse (ci/scripts/build-project.sh runs
+# `./gradlew --no-daemon --max-workers=4 build publishAllPublicationsToDeploymentRepository`
+# on JDK 17). This workflow reproduces that: it builds the spring-webmvc jar and
+# runs every module's test suite, sharded across parallel jobs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test selector, e.g. ":spring-webmvc:test --tests FooTests" (empty = full suite)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: webmvc-artifact
+            artifact: true
+            tasks: ':spring-beans:test :spring-web:test :spring-webflux:test :spring-webmvc:test :spring-websocket:test'
+          - shard: core-context
+            artifact: false
+            tasks: ':spring-jcl:test :spring-core:test :spring-core-test:test :spring-expression:test :spring-aop:test :spring-aspects:test :spring-instrument:test :spring-context:test :spring-context-indexer:test :spring-context-support:test'
+          - shard: data-messaging
+            artifact: false
+            tasks: ':spring-tx:test :spring-jdbc:test :spring-orm:test :spring-oxm:test :spring-r2dbc:test :spring-jms:test :spring-messaging:test :integration-tests:test'
+          - shard: spring-test
+            artifact: false
+            tasks: ':spring-test:test'
+    env:
+      GRADLE_ARGS: >-
+        -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false
+        --no-daemon --max-workers=4 --no-parallel --no-build-cache --no-scan
+        --console=plain --stacktrace
+        -x checkstyleMain -x checkstyleTest -x checkstyleNohttp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Build spring-webmvc jar
+        if: ${{ matrix.artifact }}
+        run: ./gradlew $GRADLE_ARGS :spring-webmvc:jar
+      - name: Upload spring-webmvc jar
+        if: ${{ matrix.artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-webmvc-jar
+          path: |
+            spring-webmvc/build/libs/spring-webmvc-*.jar
+            !spring-webmvc/build/libs/*-test-fixtures.jar
+            !spring-webmvc/build/libs/*-sources.jar
+            !spring-webmvc/build/libs/*-javadoc.jar
+          if-no-files-found: error
+      - name: Test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            if [ "${{ matrix.artifact }}" = "true" ]; then
+              ./gradlew $GRADLE_ARGS --continue ${{ inputs.test-filter }}
+            else
+              echo "test-filter set: selected tests run in the webmvc-artifact shard only"
+            fi
+          else
+            ./gradlew $GRADLE_ARGS --continue ${{ matrix.tasks }}
+          fi
+      - name: Test report (counts, failures, skip reasons)
+        if: ${{ !cancelled() }}
+        run: |
+          cat > "$RUNNER_TEMP/test_report.py" <<'PY'
+          import glob, os, re, sys
+          import xml.etree.ElementTree as ET
+
+          COND = re.compile(r'@(Disabled|Enabled|Ignore|IfProfileValue)\w*')
+          ASSUME = re.compile(r'\bassume\w*\s*\(|\bassumingThat\s*\(|\bAssumptions\.|\bAssume\.')
+          EXTENDS = re.compile(r'\bclass\s+([\w$]+)(?:<[^{]*?>)?\s+extends\s+([\w$.]+)')
+          SRC_DIRS = ('src/test/java', 'src/test/kotlin', 'src/testFixtures/java', 'src/testFixtures/kotlin')
+          INDEX = {}
+          for d in SRC_DIRS:
+              for p in glob.glob('*/' + d + '/**/*.java', recursive=True) + glob.glob('*/' + d + '/**/*.kt', recursive=True):
+                  INDEX.setdefault(os.path.splitext(os.path.basename(p))[0], []).append(p)
+
+          def read(p):
+              try:
+                  with open(p, encoding='utf-8', errors='replace') as f:
+                      return f.read().split('\n')
+              except OSError:
+                  return []
+
+          def find_src(module, fqcn):
+              rel = fqcn.split('$')[0].replace('.', '/')
+              for d in SRC_DIRS:
+                  for ext in ('.java', '.kt'):
+                      p = os.path.join(module, d, rel + ext)
+                      if os.path.isfile(p):
+                          return p
+              hits = INDEX.get(rel.rsplit('/', 1)[-1], [])
+              return hits[0] if hits else None
+
+          def annotations_above(src, i):
+              found = []
+              if COND.search(src[i]) and src[i].strip().startswith('@'):
+                  found.append(src[i].strip())
+              j = i - 1
+              while j >= 0 and i - j <= 12:
+                  t = src[j].strip()
+                  if t.endswith(';') or t == '}' or (t.endswith('{') and not t.startswith('@')):
+                      break
+                  if t.startswith('@') and COND.search(t):
+                      found.insert(0, t)
+                  j -= 1
+              return ' ; '.join(found) or None
+
+          def stmt(src, k):
+              out = src[k].strip()
+              j = k
+              while not out.endswith((';', '{')) and j + 1 < len(src) and j - k < 4:
+                  j += 1
+                  out += ' ' + src[j].strip()
+              return out
+
+          def file_assumes(src):
+              found = []
+              for k, l in enumerate(src):
+                  t = l.strip()
+                  if not t.startswith(('import', '//', '*')) and ASSUME.search(l):
+                      s = stmt(src, k)
+                      if s not in found:
+                          found.append(s)
+              return ' ; '.join(found[:4]) or None
+
+          def body_assumes(src, i):
+              found, depth, started = [], 0, False
+              for k in range(i, min(len(src), i + 300)):
+                  l = src[k]
+                  t = l.strip()
+                  if not t.startswith(('import', '//', '*')) and ASSUME.search(l):
+                      found.append(stmt(src, k))
+                  depth += l.count('{') - l.count('}')
+                  started = started or '{' in l
+                  if started and depth <= 0:
+                      break
+              return ' ; '.join(found[:3]) or None
+
+          def method_decl(src, name):
+              p = re.compile(r'\b(?:void|fun)\s+' + re.escape(name) + r'\s*\(')
+              for k, l in enumerate(src):
+                  if p.search(l):
+                      return k
+              return -1
+
+          def class_decl(src, name):
+              p = re.compile(r'\b(?:class|interface|object)\s+' + re.escape(name) + r'\b')
+              for k, l in enumerate(src):
+                  t = l.strip()
+                  if not t.startswith(('//', '*', 'import')) and p.search(l):
+                      return k
+              return -1
+
+          def setup_assumes(src):
+              out = []
+              for k, l in enumerate(src):
+                  if re.search(r'@(BeforeEach|BeforeAll|Before|BeforeClass)\b', l):
+                      a = body_assumes(src, k + 1)
+                      if a:
+                          out.append(a)
+              return ' ; '.join(out) or None
+
+          def reason(module, cls, name):
+              m = re.match(r'([A-Za-z_$][\w$]*)\s*(?:\(|\[|$)', name)
+              method = m.group(1) if m else None
+              if cls == 'UnknownClass' or (method is None and re.match(r'^[\w$.]+$', name) and '.' in name):
+                  cls, method = name.split('(')[0].strip(), None
+              path = find_src(module, cls)
+              seen = set()
+              nested = cls.split('.')[-1].split('$')
+              while path and path not in seen:
+                  seen.add(path)
+                  src = read(path)
+                  if method:
+                      k = method_decl(src, method)
+                      if k >= 0:
+                          a = annotations_above(src, k)
+                          if a:
+                              return 'condition on test method: ' + a
+                          a = body_assumes(src, k)
+                          if a:
+                              return 'assumption in test method: ' + a
+                  for n in reversed(nested):
+                      k = class_decl(src, n)
+                      if k >= 0:
+                          a = annotations_above(src, k)
+                          if a:
+                              return 'class-level condition on ' + n + ': ' + a
+                  a = setup_assumes(src)
+                  if a:
+                      return 'assumption in test setup of ' + os.path.basename(path) + ': ' + a
+                  e = EXTENDS.search('\n'.join(src))
+                  if not e:
+                      break
+                  sup = e.group(2).split('.')[-1]
+                  nested = [sup]
+                  hits = INDEX.get(sup, [])
+                  path = hits[0] if hits else None
+              # Parameterized invocations ("[5] Undertow") lose the method name in the
+              # JUnit XML: report the runtime assumptions declared in the class chain.
+              for p in seen:
+                  a = file_assumes(read(p))
+                  if a:
+                      return 'runtime assumption aborting this parameterized invocation, declared in ' + os.path.basename(p) + ': ' + a
+              return None
+
+          totals = {}
+          skipped, failed = [], []
+          for x in sorted(glob.glob('**/build/test-results/test/TEST-*.xml', recursive=True)):
+              module = x.split('/build/test-results/')[0]
+              try:
+                  root = ET.parse(x).getroot()
+              except ET.ParseError:
+                  continue
+              t = totals.setdefault(module, [0, 0, 0, 0])
+              for tc in root.iter('testcase'):
+                  t[0] += 1
+                  cls, name = tc.get('classname', ''), tc.get('name', '')
+                  s = tc.find('skipped')
+                  f = tc.find('failure') if tc.find('failure') is not None else tc.find('error')
+                  if f is not None:
+                      t[2] += 1
+                      failed.append((module, cls, name, (f.get('message') or '').strip()[:400]))
+                  elif s is not None:
+                      t[3] += 1
+                      r = (s.get('message') or '').strip()
+                      src_r = None
+                      try:
+                          src_r = reason(module, cls, name)
+                      except Exception:
+                          src_r = None
+                      if r and src_r:
+                          r = r + ' (' + src_r + ')'
+                      r = r or src_r or 'skipped by a JUnit condition/assumption in ' + cls + ' (no explicit annotation located)'
+                      skipped.append((module, cls, name, re.sub(r'\s+', ' ', r)[:500]))
+                  else:
+                      t[1] += 1
+          for m, c, n, r in failed:
+              print('FAILED: %s | %s | %s | %s' % (m, c, n, r))
+          for m, c, n, r in skipped:
+              print('SKIPPED: %s | %s | %s | %s' % (m, c, n, r))
+          print('SKIP REPORT: %d skipped tests listed with their reasons' % len(skipped))
+          gt = [0, 0, 0, 0]
+          for m in sorted(totals):
+              a = totals[m]
+              gt = [g + v for g, v in zip(gt, a)]
+              print('TEST SUMMARY [:%s]: %d tests, %d passed, %d failed, %d skipped' % (m, a[0], a[1], a[2], a[3]))
+          print('TEST SUMMARY [total]: %d tests, %d passed, %d failed, %d skipped' % tuple(gt))
+          PY
+          python3 "$RUNNER_TEMP/test_report.py"
