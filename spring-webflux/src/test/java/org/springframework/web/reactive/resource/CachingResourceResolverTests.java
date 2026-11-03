@@ -51,6 +51,8 @@ public class CachingResourceResolverTests {
 
 	private Cache cache;
 
+	private CachingResourceResolver cachingResolver;
+
 	private ResourceResolverChain chain;
 
 	private List<Resource> locations;
@@ -62,7 +64,9 @@ public class CachingResourceResolverTests {
 		this.cache = new ConcurrentMapCache("resourceCache");
 
 		List<ResourceResolver> resolvers = new ArrayList<>();
-		resolvers.add(new CachingResourceResolver(this.cache));
+		this.cachingResolver = new CachingResourceResolver(this.cache);
+		resolvers.add(this.cachingResolver);
+		resolvers.add(new EncodedResourceResolver());
 		resolvers.add(new PathResourceResolver());
 		this.chain = new DefaultResourceResolverChain(resolvers);
 
@@ -84,7 +88,7 @@ public class CachingResourceResolverTests {
 	@Test
 	public void resolveResourceInternalFromCache() {
 		Resource expected = mock();
-		this.cache.put(resourceKey("bar.css"), expected);
+		this.cache.put(this.cachingResolver.computeKey(null, "bar.css", this.locations), expected);
 
 		MockServerWebExchange exchange = MockServerWebExchange.from(get(""));
 		Resource actual = this.chain.resolveResource(exchange, "bar.css", this.locations).block(TIMEOUT);
@@ -129,55 +133,76 @@ public class CachingResourceResolverTests {
 		// 1. Resolve plain resource
 
 		MockServerWebExchange exchange = MockServerWebExchange.from(get(file));
-		Resource expected = this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+		this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
 
-		String cacheKey = resourceKey(file);
-		assertThat(this.cache.get(cacheKey).get()).isSameAs(expected);
-
+		Resource actual = getFromResourceCache(exchange, file);
+		assertThat(actual.getFile().getName()).isEqualTo("bar.css");
 
 		// 2. Resolve with Accept-Encoding
 
 		exchange = MockServerWebExchange.from(get(file)
 				.header("Accept-Encoding", "gzip ; a=b  , deflate ,  br  ; c=d "));
-		expected = this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+		this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
 
-		cacheKey = resourceKey(file + "+encoding=br,gzip");
-		assertThat(this.cache.get(cacheKey).get()).isSameAs(expected);
+		actual = getFromResourceCache(exchange, file);
+		assertThat(actual.getFile().getName()).isEqualTo("bar.css.gz");
 
 		// 3. Resolve with Accept-Encoding but no matching codings
 
 		exchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", "deflate"));
-		expected = this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+		this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
 
-		cacheKey = resourceKey(file);
-		assertThat(this.cache.get(cacheKey).get()).isSameAs(expected);
+		actual = getFromResourceCache(exchange, file);
+		assertThat(actual.getFile().getName()).isEqualTo("bar.css");
 	}
 
 	@Test
-	public void resolveResourceNoAcceptEncoding() {
+	public void resolveResourceNoAcceptEncoding() throws IOException {
 		String file = "bar.css";
 		MockServerWebExchange exchange = MockServerWebExchange.from(get(file));
-		Resource expected = this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+		this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
 
-		String cacheKey = resourceKey(file);
-		Object actual = this.cache.get(cacheKey).get();
-
-		assertThat(actual).isEqualTo(expected);
+		Resource actual = getFromResourceCache(exchange, file);
+		assertThat(actual.getFile().getName()).isEqualTo("bar.css");
 	}
 
 	@Test
 	public void resolveResourceMatchingEncoding() {
 		Resource resource = mock();
 		Resource gzipped = mock();
-		this.cache.put(resourceKey("bar.css"), resource);
-		this.cache.put(resourceKey("bar.css+encoding=gzip"), gzipped);
 
-		String file = "bar.css";
-		MockServerWebExchange exchange = MockServerWebExchange.from(get(file));
-		assertThat(this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT)).isSameAs(resource);
+		MockServerWebExchange exchange = MockServerWebExchange.from(get("bar.css"));
+		this.cache.put(this.cachingResolver.computeKey(exchange, "bar.css", this.locations), resource);
 
-		exchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", "gzip"));
-		assertThat(this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT)).isSameAs(gzipped);
+		MockServerWebExchange gzipExchange = MockServerWebExchange.from(get("bar.css").header("Accept-Encoding", "gzip"));
+		this.cache.put(this.cachingResolver.computeKey(gzipExchange, "bar.css", this.locations), gzipped);
+
+		assertThat(this.chain.resolveResource(exchange, "bar.css", this.locations).block(TIMEOUT)).isSameAs(resource);
+		assertThat(this.chain.resolveResource(gzipExchange, "bar.css", this.locations).block(TIMEOUT)).isSameAs(gzipped);
+	}
+
+	@Test
+	public void shareCacheBetweenResourceLocations() {
+		MockServerWebExchange exchange = MockServerWebExchange.from(get("bar.css"));
+
+		List<Resource> firstLocations = List.of(new ClassPathResource("testalternatepath/", getClass()));
+		Resource firstResource = this.chain.resolveResource(exchange, "bar.css", firstLocations).block(TIMEOUT);
+
+		List<Resource> secondLocations = List.of(new ClassPathResource("test/", getClass()));
+		Resource secondResource = this.chain.resolveResource(exchange, "bar.css", secondLocations).block(TIMEOUT);
+
+		assertThat(firstResource).isNotSameAs(secondResource);
+	}
+
+	@Test
+	public void doNotResolveCachedResourceFromOtherLocations() {
+		MockServerWebExchange exchange = MockServerWebExchange.from(get("baz.css"));
+
+		List<Resource> firstLocations = List.of(new ClassPathResource("testalternatepath/", getClass()));
+		assertThat(this.chain.resolveResource(exchange, "baz.css", firstLocations).block(TIMEOUT)).isNotNull();
+
+		List<Resource> secondLocations = List.of(new ClassPathResource("test/", getClass()));
+		assertThat(this.chain.resolveResource(exchange, "baz.css", secondLocations).block(TIMEOUT)).isNull();
 	}
 
 	@ParameterizedTest
@@ -185,20 +210,19 @@ public class CachingResourceResolverTests {
 	void resolveEncodedResourceWithCodingContainingGzip(String acceptEncoding, GzippedFiles gzippedFiles) {
 		String file = "bar.css";
 		gzippedFiles.create(file);
-		ResourceResolverChain chain = encodedResourceChain();
 
 		// 1. Resolve with a coding that merely contains "gzip"
 
 		MockServerWebExchange exchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", acceptEncoding));
-		Resource resolved = chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+		Resource resolved = this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
 
 		assertThat(resolved).isNotInstanceOf(HttpResource.class);
-		assertThat(this.cache.get(resourceKey(file)).get()).isSameAs(resolved);
+		assertThat(getFromResourceCache(null, file)).isSameAs(resolved);
 
 		// 2. Resolve without Accept-Encoding from the cache
 
 		exchange = MockServerWebExchange.from(get(file));
-		Resource plain = chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+		Resource plain = this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
 
 		assertThat(plain).isSameAs(resolved);
 		assertThat(plain).isNotInstanceOf(HttpResource.class);
@@ -206,23 +230,17 @@ public class CachingResourceResolverTests {
 		// 3. Resolve with gzip under its own cache key
 
 		exchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", "GZIP;q=0.8"));
-		Resource gzipped = chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
+		Resource gzipped = this.chain.resolveResource(exchange, file, this.locations).block(TIMEOUT);
 
 		assertThat(gzipped).isInstanceOf(HttpResource.class);
-		assertThat(this.cache.get(resourceKey(file + "+encoding=gzip")).get()).isSameAs(gzipped);
-		assertThat(this.cache.get(resourceKey(file)).get()).isSameAs(plain);
+		MockServerWebExchange gzipExchange = MockServerWebExchange.from(get(file).header("Accept-Encoding", "gzip"));
+		assertThat(getFromResourceCache(gzipExchange, file)).isSameAs(gzipped);
+		assertThat(getFromResourceCache(null, file)).isSameAs(plain);
 	}
 
-	private ResourceResolverChain encodedResourceChain() {
-		List<ResourceResolver> resolvers = new ArrayList<>();
-		resolvers.add(new CachingResourceResolver(this.cache));
-		resolvers.add(new EncodedResourceResolver());
-		resolvers.add(new PathResourceResolver());
-		return new DefaultResourceResolverChain(resolvers);
-	}
-
-	private static String resourceKey(String key) {
-		return CachingResourceResolver.RESOLVED_RESOURCE_CACHE_KEY_PREFIX + key;
+	private Resource getFromResourceCache(MockServerWebExchange exchange, String file) {
+		String cacheKey = this.cachingResolver.computeKey(exchange, file, this.locations);
+		return this.cache.get(cacheKey, Resource.class);
 	}
 
 }
